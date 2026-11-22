@@ -118,6 +118,7 @@ export function buildUserSessionPayload(userId: string) {
 
   const profile = db.user_profiles.find((p) => p.userId === userId);
   const roles = db.user_roles.filter((r) => r.userId === userId).map((r) => r.role);
+  const permissions = db.user_permissions.filter((p) => p.userId === userId).map((p) => p.permission);
   const accountPrefs = db.account_preferences.find((p) => p.userId === userId);
   const tradingPrefs = db.trading_preferences.find((p) => p.userId === userId);
   const riskSettings = db.risk_settings.find((r) => r.userId === userId);
@@ -142,6 +143,40 @@ export function buildUserSessionPayload(userId: string) {
 
   const unreadNotifications = db.notifications.filter((n) => n.userId === userId && !n.isRead).length;
 
+  const userSub = db.user_subscriptions.find(
+    (s) =>
+      s.userId === userId &&
+      s.status === 'ACTIVE' &&
+      (!s.expiresAt || new Date(s.expiresAt).getTime() > Date.now())
+  );
+  const activePlan =
+    (userSub ? db.plans.find((p) => p.id === userSub.planId) : null) ||
+    db.plans.find((p) => p.slug === 'starter') ||
+    db.plans[0] ||
+    null;
+
+  const restrictedApps = db.application_registry
+    .filter((a) => Array.isArray(a.restrictedUserIds) && a.restrictedUserIds.includes(userId))
+    .map((a) => a.id);
+
+  const userTrades = db.trades.filter((t) => t.userId === userId);
+  const computeModeStats = (mode: 'DEMO' | 'REAL') => {
+    const list = userTrades.filter((t) => t.mode === mode);
+    const open = list.filter((t) => t.status === 'OPEN').length;
+    const closed = list.filter((t) => t.status !== 'OPEN').length;
+    const wins = list.filter((t) => t.status === 'WON').length;
+    const losses = list.filter((t) => t.status === 'LOST').length;
+    const profitLoss = list.reduce((acc, t) => acc + Number(t.profit || 0), 0);
+    return {
+      total: list.length,
+      open,
+      closed,
+      wins,
+      losses,
+      profitLoss: profitLoss.toFixed(2),
+    };
+  };
+
   return {
     user: {
       id: user.id,
@@ -155,6 +190,24 @@ export function buildUserSessionPayload(userId: string) {
     },
     profile,
     roles,
+    permissions,
+    subscription: activePlan
+      ? {
+          planId: activePlan.id,
+          planName: activePlan.name,
+          planSlug: activePlan.slug,
+          allowedApps: activePlan.allowedApps,
+          maxDailyTrades: activePlan.maxDailyTrades,
+          maxBots: activePlan.maxBots,
+          status: userSub?.status || 'ACTIVE',
+          expiresAt: userSub?.expiresAt || null,
+        }
+      : null,
+    restrictedApps,
+    tradingStats: {
+      demo: computeModeStats('DEMO'),
+      real: computeModeStats('REAL'),
+    },
     accountPreferences: accountPrefs,
     tradingPreferences: tradingPrefs,
     riskSettings,
@@ -162,6 +215,7 @@ export function buildUserSessionPayload(userId: string) {
     activeDerivAccount: derivAccounts.find((a) => a.isActive) || derivAccounts[0] || null,
     platformLedger: {
       currency: ledgerAccount?.currency || 'USD',
+      status: ledgerAccount?.status || 'ACTIVE',
       availableBalance: ledgerBalance?.availableBalance || '0.00000000',
       updatedAt: ledgerBalance?.updatedAt || user.createdAt,
     },
@@ -528,6 +582,27 @@ router.get('/session', (req: AuthenticatedRequest, res: Response) => {
   }
   const payload = buildUserSessionPayload(req.authUser.id);
   return res.json({ authenticated: true, ...payload });
+});
+
+router.get('/me', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+  const payload = buildUserSessionPayload(req.authUser!.id);
+  return res.json({ authenticated: true, ...payload });
+});
+
+router.get('/permissions', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+  const payload = buildUserSessionPayload(req.authUser!.id);
+  return res.json({
+    roles: payload?.roles || [],
+    permissions: payload?.permissions || [],
+    allowedApps: payload?.subscription?.allowedApps || ['bot', 'trader', 'charts', 'options'],
+    restrictedApps: payload?.restrictedApps || [],
+  });
+});
+
+router.get('/csrf', (req: Request, res: Response) => {
+  const csrfToken = generateSecureToken(24);
+  res.cookie('pipflow_csrf', csrfToken, getCookieOptions(SESSION_TTL_MS, false));
+  return res.json({ csrfToken });
 });
 
 router.post('/onboarding', requireAuth, async (req: AuthenticatedRequest, res: Response) => {

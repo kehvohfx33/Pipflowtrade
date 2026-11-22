@@ -109,9 +109,9 @@ export const LiveCandleChart: React.FC<LiveCandleChartProps> = ({
         setLoading(false);
       })
       .catch(() => {
-        // Fallback to direct public Deriv WebSocket v3 (read-only market data, no credentials)
+        // Fallback to direct public Deriv WebSocket (read-only market data, no credentials)
         try {
-          const directWs = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
+          const directWs = new WebSocket('wss://api.derivws.com/trading/v1/options/ws/public');
           directWs.onopen = () => {
             directWs.send(
               JSON.stringify({

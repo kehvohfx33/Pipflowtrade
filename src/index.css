@@ -4,26 +4,29 @@
 @layer base {
   :root {
     --bg-main: #050914;
-    --bg-secondary: #0B1220;
+    --bg-nav: #070D19;
     --bg-card: #0D1728;
-    --accent-cyan: #00C8FF;
-    --accent-magenta: #ED168F;
-    --accent-green: #20F000;
+    --bg-card-secondary: #101C30;
+    --bg-muted: #0A1220;
+    --accent-cyan: #11C9F4;
+    --accent-blue: #2589F5;
+    --accent-pink: #EC2698;
+    --accent-green: #16D94B;
     --accent-red: #FF1744;
-    --text-primary: #FFFFFF;
-    --text-secondary: #8492A6;
-    --border-hairline: #1D2B40;
+    --text-primary: #F4F7FC;
+    --text-secondary: #8996AA;
+    --border-hairline: #17243A;
   }
 
   html {
     background-color: #050914;
-    color: #FFFFFF;
-    font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    color: #F4F7FC;
+    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
     scroll-behavior: smooth;
   }
 
   h1, h2, h3, h4, .font-display {
-    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    font-family: 'Outfit', 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
   }
 
   .font-mono-num {

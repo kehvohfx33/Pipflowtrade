@@ -1,7 +1,7 @@
 import { NextFunction, Request, Response } from 'express';
 import { store } from '../db/store.ts';
 import { hashToken } from '../security/crypto.ts';
-import { AdministratorAccountRecord, UserRecord, UserRole } from '../types.ts';
+import { AdminRole, AdministratorAccountRecord, UserRecord, UserRole } from '../types.ts';
 
 export interface AuthenticatedRequest extends Request {
   authUser?: UserRecord;
@@ -84,7 +84,16 @@ export function requireCsrf(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
-export function requireAdminAuth(allowedRoles: Array<'SUPER_ADMIN' | 'ADMIN' | 'SUPPORT'> = ['SUPER_ADMIN', 'ADMIN', 'SUPPORT']) {
+const ALL_ADMIN_ROLES: AdminRole[] = [
+  'SUPER_ADMIN',
+  'ADMIN',
+  'FINANCE_ADMIN',
+  'APP_MANAGER',
+  'SUPPORT',
+  'AUDITOR',
+];
+
+export function requireAdminAuth(allowedRoles: AdminRole[] = ALL_ADMIN_ROLES) {
   return (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
     const token = req.cookies?.pipflow_admin_sid as string | undefined;
     if (!token) {

@@ -1,5 +1,12 @@
 export type UserStatus = 'ACTIVE' | 'SUSPENDED' | 'LOCKED';
 export type UserRole = 'SUPER_ADMIN' | 'ADMIN' | 'SUPPORT' | 'USER';
+export type AdminRole =
+  | 'SUPER_ADMIN'
+  | 'ADMIN'
+  | 'FINANCE_ADMIN'
+  | 'APP_MANAGER'
+  | 'SUPPORT'
+  | 'AUDITOR';
 export type AppId = 'bot' | 'trader' | 'charts' | 'options';
 export type TradingMode = 'DEMO' | 'REAL';
 
@@ -65,7 +72,7 @@ export interface AdministratorAccountRecord {
   userId: string | null;
   email: string;
   passwordHash: string;
-  role: 'SUPER_ADMIN' | 'ADMIN' | 'SUPPORT';
+  role: AdminRole;
   mfaEnabled: boolean;
   mfaSecretEncrypted: { ciphertext: string; iv: string; authTag: string } | null;
   status: 'ACTIVE' | 'SUSPENDED';
@@ -109,6 +116,7 @@ export interface EncryptedDerivTokenRecord {
   iv: string;
   authTag: string;
   scopes: string;
+  authMethod?: 'OAUTH_PKCE' | 'LEGACY_WS';
   createdAt: string;
   updatedAt: string;
 }
@@ -152,12 +160,21 @@ export interface RiskSettingsRecord {
 export interface ApplicationRegistryRecord {
   id: AppId;
   name: string;
+  subtitle?: string;
   description: string;
   productionUrl: string;
+  vercelProjectRef?: string;
+  vercelDeploymentUrl?: string | null;
   hostingProvider: string;
   version: string;
   ssoEnabled: boolean;
   iframeCompatible: boolean;
+  visibility?: 'PUBLIC' | 'PRIVATE' | 'HIDDEN';
+  maintenanceMode?: boolean;
+  maintenanceMessage?: string | null;
+  planRestrictions?: string[];
+  restrictedUserIds?: string[];
+  healthCheckEnabled?: boolean;
   healthStatus: 'ONLINE' | 'DEGRADED' | 'OFFLINE' | 'UNKNOWN';
   lastError: string | null;
   latencyMs: number | null;
@@ -191,12 +208,21 @@ export interface PlatformLedgerBalanceRecord {
   updatedAt: string;
 }
 
+export type LedgerAdjustmentType =
+  | 'CREDIT'
+  | 'DEBIT'
+  | 'SET_BALANCE'
+  | 'RESET'
+  | 'FREEZE'
+  | 'UNFREEZE'
+  | 'REVERSAL';
+
 export interface BalanceAdjustmentRequestRecord {
   id: string;
   userId: string;
   ledgerAccountId: string;
   requestedByAdminId: string;
-  entryType: 'CREDIT' | 'DEBIT' | 'REVERSAL';
+  entryType: LedgerAdjustmentType;
   amount: string;
   currency: string;
   reason: string;
@@ -221,7 +247,7 @@ export interface PlatformLedgerEntryRecord {
   adminId: string;
   adminEmail: string;
   adjustmentRequestId: string | null;
-  entryType: 'CREDIT' | 'DEBIT' | 'REVERSAL';
+  entryType: LedgerAdjustmentType;
   amount: string;
   currency: string;
   previousBalance: string;
@@ -316,8 +342,128 @@ export interface OAuthStateRecord {
   state: string;
   userId: string | null;
   intent: 'LOGIN' | 'CONNECT';
+  codeVerifier?: string | null;
+  redirectUri?: string | null;
   createdAt: string;
   expiresAt: string;
+}
+
+export interface PlanRecord {
+  id: string;
+  name: string;
+  slug: string;
+  description: string;
+  priceMonthly: string;
+  currency: string;
+  allowedApps: AppId[];
+  maxDailyTrades: number;
+  maxBots: number;
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface UserSubscriptionRecord {
+  id: string;
+  userId: string;
+  planId: string;
+  status: 'ACTIVE' | 'EXPIRED' | 'CANCELLED';
+  expiresAt: string | null;
+  assignedByAdminId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface BotStrategyRecord {
+  id: string;
+  userId: string;
+  name: string;
+  strategyType: string;
+  symbol: string;
+  xmlContent: string;
+  connectedAccountId: string | null;
+  environment: TradingMode;
+  status: 'IDLE' | 'RUNNING' | 'SUSPENDED' | 'STOPPED';
+  stake: string;
+  userAuthorizedExecution: boolean;
+  lastActivityAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface BotExecutionLogRecord {
+  id: string;
+  botId: string;
+  userId: string;
+  level: 'INFO' | 'WARN' | 'ERROR';
+  message: string;
+  createdAt: string;
+}
+
+export interface CommissionRecord {
+  id: string;
+  userId: string | null;
+  appId: AppId;
+  tradeId: string | null;
+  source: 'ESTIMATED' | 'CONFIRMED' | 'PARTNER_REPORT';
+  amount: string;
+  currency: string;
+  status: 'PENDING' | 'CONFIRMED' | 'RECONCILED';
+  periodDate: string;
+  notes: string;
+  createdAt: string;
+}
+
+export interface WebsiteCapabilityItem {
+  id: string;
+  title: string;
+  description: string;
+  iconKey: string;
+  route: string;
+}
+
+export interface WebsiteFaqItem {
+  id: string;
+  question: string;
+  answer: string;
+}
+
+export interface WebsiteContentConfig {
+  brandName: string;
+  heroLabel: string;
+  heroTitle: string;
+  heroHighlight: string;
+  heroDescription: string;
+  primaryCtaLabel: string;
+  secondaryCtaLabel: string;
+  derivSignupUrl: string;
+  derivSignupLabel: string;
+  liveChartsLabel: string;
+  emailSignUpLabel: string;
+  announcement: {
+    enabled: boolean;
+    text: string;
+    severity: 'INFO' | 'WARNING' | 'SUCCESS';
+  };
+  maintenanceNotice: {
+    enabled: boolean;
+    message: string;
+  };
+  capabilities: WebsiteCapabilityItem[];
+  faqs: WebsiteFaqItem[];
+  footer: {
+    description: string;
+    contactEmail: string;
+    supportHours: string;
+    copyrightText: string;
+  };
+  seo: {
+    title: string;
+    description: string;
+    ogTitle: string;
+    ogDescription: string;
+  };
+  updatedAt: string;
 }
 
 export interface DatabaseSnapshot {
@@ -348,4 +494,10 @@ export interface DatabaseSnapshot {
   support_tickets: SupportTicketRecord[];
   system_settings: SystemSettingRecord[];
   oauth_states: OAuthStateRecord[];
+  plans: PlanRecord[];
+  user_subscriptions: UserSubscriptionRecord[];
+  bot_strategies: BotStrategyRecord[];
+  bot_execution_logs: BotExecutionLogRecord[];
+  commission_records: CommissionRecord[];
+  website_content: WebsiteContentConfig;
 }

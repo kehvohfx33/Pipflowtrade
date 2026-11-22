@@ -12,6 +12,7 @@ import derivRoutes, { handleDerivOAuthCallback } from './server/routes/deriv.ts'
 import appsRoutes from './server/routes/apps.ts';
 import userRoutes from './server/routes/user.ts';
 import adminRoutes from './server/routes/admin.ts';
+import tradingRoutes from './server/routes/trading.ts';
 import { realtimeHub } from './server/services/realtime.ts';
 import { derivMarketFeed } from './server/services/deriv-ws.ts';
 
@@ -22,7 +23,7 @@ async function startServer() {
 
   app.set('trust proxy', 1);
 
-  // Security Headers & Content Security Policy allowing Vercel app embedding
+  // Security Headers & Content Security Policy
   app.use(
     helmet({
       contentSecurityPolicy: isProd
@@ -40,6 +41,8 @@ async function startServer() {
                 'https://*.pipflowtrade.site',
                 'https://ws.derivws.com',
                 'wss://ws.derivws.com',
+                'https://api.derivws.com',
+                'wss://api.derivws.com',
               ],
               frameSrc: [
                 "'self'",
@@ -104,22 +107,29 @@ async function startServer() {
   // Mount Domain API Routers
   app.use('/api/auth', authRoutes);
   app.use('/api/deriv', derivRoutes);
+  app.use('/api/trading', tradingRoutes);
   app.use('/api', appsRoutes);
   app.use('/api', userRoutes);
+  app.use('/api/admin', adminRoutes);
   app.use('/api/private-admin', adminRoutes);
 
   // Support Deriv OAuth2 callback even if developers.deriv.com points to /auth/callback, /oauth/callback, or /
   app.get('/auth/callback', handleDerivOAuthCallback);
   app.get('/oauth/callback', handleDerivOAuthCallback);
   app.get('/', (req, res, next) => {
-    if (typeof req.query.acct1 === 'string' && typeof req.query.token1 === 'string') {
+    if (
+      (typeof req.query.acct1 === 'string' && typeof req.query.token1 === 'string') ||
+      (typeof req.query.code === 'string' && typeof req.query.state === 'string') ||
+      (typeof req.query.error === 'string' && typeof req.query.state === 'string')
+    ) {
       return handleDerivOAuthCallback(req as any, res);
     }
     next();
   });
 
-  // Support optional ADMIN_PRIVATE_SLUG route from Render env (still requires server admin auth)
-  const adminSlug = process.env.ADMIN_PRIVATE_SLUG?.trim().replace(/^\/+/, '');
+  // Support optional ADMIN_PRIVATE_SLUG route from Render env (server-side only, requires admin session)
+  const rawSlug = process.env.ADMIN_PRIVATE_SLUG?.trim() || process.env.VITE_ADMIN_PRIVATE_SLUG?.trim();
+  const adminSlug = rawSlug ? rawSlug.replace(/^\/+/, '') : '';
   if (adminSlug) {
     app.get(`/${adminSlug}`, (_req, res) => {
       res.redirect('/#/admin');

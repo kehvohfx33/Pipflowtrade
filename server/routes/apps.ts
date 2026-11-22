@@ -57,6 +57,31 @@ async function probeApplicationHealth(appUrl: string): Promise<{
   }
 }
 
+function getEffectiveUserPlan(userId: string) {
+  const db = store.snapshot();
+  const sub = db.user_subscriptions.find(
+    (s) =>
+      s.userId === userId &&
+      s.status === 'ACTIVE' &&
+      (!s.expiresAt || new Date(s.expiresAt).getTime() > Date.now())
+  );
+  return (
+    (sub ? db.plans.find((p) => p.id === sub.planId) : null) ||
+    db.plans.find((p) => p.slug === 'starter') ||
+    db.plans[0] ||
+    null
+  );
+}
+
+router.get('/public/content', (_req: Request, res: Response) => {
+  const db = store.snapshot();
+  const visibleApps = db.application_registry.filter((a) => a.visibility !== 'HIDDEN');
+  return res.json({
+    content: db.website_content,
+    applications: visibleApps,
+  });
+});
+
 router.get('/public/stats', (_req: Request, res: Response) => {
   const db = store.snapshot();
   const activeAccounts = db.users.filter((u) => u.status === 'ACTIVE').length;
@@ -64,7 +89,7 @@ router.get('/public/stats', (_req: Request, res: Response) => {
     (d) => d.connectionStatus === 'CONNECTED'
   ).length;
   const executedTrades = db.trades.length;
-  const registeredApps = db.application_registry.length;
+  const registeredApps = db.application_registry.filter((a) => a.visibility !== 'HIDDEN').length;
 
   return res.json({
     platformUsers: activeAccounts,
@@ -77,19 +102,46 @@ router.get('/public/stats', (_req: Request, res: Response) => {
   });
 });
 
-router.get('/apps', (_req: Request, res: Response) => {
-  const apps = store.snapshot().application_registry;
+router.get(['/apps', '/applications'], (req: AuthenticatedRequest, res: Response) => {
+  const db = store.snapshot();
+  const plan = req.authUser ? getEffectiveUserPlan(req.authUser.id) : null;
+  const apps = db.application_registry
+    .filter((a) => a.visibility !== 'HIDDEN')
+    .map((app) => {
+      const userBlocked = Boolean(
+        req.authUser && Array.isArray(app.restrictedUserIds) && app.restrictedUserIds.includes(req.authUser.id)
+      );
+      const planBlocked = Boolean(plan && !plan.allowedApps.includes(app.id));
+      const planRestrictionBlocked = Boolean(
+        plan &&
+          Array.isArray(app.planRestrictions) &&
+          app.planRestrictions.length > 0 &&
+          !app.planRestrictions.includes(plan.id)
+      );
+      return {
+        ...app,
+        userAccessible: !app.maintenanceMode && !userBlocked && !planBlocked && !planRestrictionBlocked,
+        restrictionReason: app.maintenanceMode
+          ? app.maintenanceMessage || `${app.name} is undergoing scheduled maintenance.`
+          : userBlocked
+          ? 'Access restricted by platform administrator.'
+          : planBlocked || planRestrictionBlocked
+          ? `Requires plan upgrade beyond ${plan?.name || 'current plan'}.`
+          : null,
+      };
+    });
   return res.json({ apps });
 });
 
-router.get('/apps/:appId/health', async (req: Request, res: Response) => {
+router.get(['/apps/:appId/health', '/applications/:appId/health'], async (req: Request, res: Response) => {
   const appId = req.params.appId as AppId;
   const app = store.snapshot().application_registry.find((a) => a.id === appId);
   if (!app) {
     return res.status(404).json({ error: 'Unknown application ID.' });
   }
 
-  const result = await probeApplicationHealth(app.productionUrl);
+  const targetUrl = app.vercelDeploymentUrl || app.productionUrl;
+  const result = await probeApplicationHealth(targetUrl);
   await store.transaction((db) => {
     const target = db.application_registry.find((a) => a.id === appId);
     if (target) {
@@ -106,7 +158,7 @@ router.get('/apps/:appId/health', async (req: Request, res: Response) => {
   return res.json({ app: updated, probe: result });
 });
 
-router.post('/apps/:appId/authorize', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+router.post(['/apps/:appId/authorize', '/applications/:appId/authorize'], requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const appId = req.params.appId as AppId;
     const db = store.snapshot();
@@ -114,8 +166,30 @@ router.post('/apps/:appId/authorize', requireAuth, async (req: AuthenticatedRequ
     if (!app) {
       return res.status(404).json({ error: 'Application not found in registry.' });
     }
+    if (app.visibility === 'HIDDEN') {
+      return res.status(403).json({ error: `${app.name} is currently unavailable.` });
+    }
+    if (app.maintenanceMode) {
+      return res.status(503).json({
+        error: app.maintenanceMessage || `${app.name} is temporarily in maintenance mode.`,
+      });
+    }
     if (!app.ssoEnabled) {
       return res.status(403).json({ error: `${app.name} SSO is currently disabled by administrator.` });
+    }
+    if (Array.isArray(app.restrictedUserIds) && app.restrictedUserIds.includes(req.authUser!.id)) {
+      return res.status(403).json({ error: `Your account does not currently have access to ${app.name}.` });
+    }
+
+    const plan = getEffectiveUserPlan(req.authUser!.id);
+    if (
+      plan &&
+      (!plan.allowedApps.includes(appId) ||
+        (Array.isArray(app.planRestrictions) && app.planRestrictions.length > 0 && !app.planRestrictions.includes(plan.id)))
+    ) {
+      return res.status(403).json({
+        error: `Your current membership plan (${plan.name}) does not include ${app.name}.`,
+      });
     }
 
     const activeAccount =
@@ -154,15 +228,30 @@ router.post('/apps/:appId/authorize', requireAuth, async (req: AuthenticatedRequ
       });
     });
 
-    const launchUrl = new URL(app.productionUrl);
+    const targetOrigin = (app.productionUrl || '').trim();
+    const launchUrl = new URL(targetOrigin);
     launchUrl.searchParams.set('sso_code', ssoCode);
     launchUrl.searchParams.set('origin', process.env.APP_URL || 'https://pipflowtrade.site');
+
+    let fallbackLaunchUrl: string | null = null;
+    if (app.vercelDeploymentUrl && app.vercelDeploymentUrl.trim()) {
+      try {
+        const alt = new URL(app.vercelDeploymentUrl.trim());
+        alt.searchParams.set('sso_code', ssoCode);
+        alt.searchParams.set('origin', process.env.APP_URL || 'https://pipflowtrade.site');
+        fallbackLaunchUrl = alt.toString();
+      } catch {
+        fallbackLaunchUrl = null;
+      }
+    }
 
     return res.json({
       appId,
       appName: app.name,
       productionUrl: app.productionUrl,
+      vercelDeploymentUrl: app.vercelDeploymentUrl || null,
       launchUrl: launchUrl.toString(),
+      fallbackLaunchUrl,
       ssoCode,
       expiresInSeconds: 90,
       iframeCompatible: app.iframeCompatible,
@@ -187,13 +276,19 @@ router.post('/apps/:appId/authorize', requireAuth, async (req: AuthenticatedRequ
  * Vercel apps (bot/trader/charts/options) exchange sso_code or Bearer token here
  * to verify user identity, active Deriv mode, and shared risk limits.
  */
-router.get('/apps/:appId/session', async (req: AuthenticatedRequest, res: Response) => {
+router.get(['/apps/:appId/session', '/applications/:appId/session'], async (req: AuthenticatedRequest, res: Response) => {
   try {
     const appId = req.params.appId as AppId;
     const db = store.snapshot();
     const app = db.application_registry.find((a) => a.id === appId);
     if (!app) {
       return res.status(404).json({ error: 'Unknown application.' });
+    }
+    if (app.maintenanceMode) {
+      return res.status(503).json({
+        valid: false,
+        error: app.maintenanceMessage || `${app.name} is currently under maintenance.`,
+      });
     }
 
     const ssoCode =
@@ -241,6 +336,10 @@ router.get('/apps/:appId/session', async (req: AuthenticatedRequest, res: Respon
     const user = db.users.find((u) => u.id === userId && u.status === 'ACTIVE');
     if (!user) {
       return res.status(403).json({ valid: false, error: 'User account is unavailable or suspended.' });
+    }
+
+    if (Array.isArray(app.restrictedUserIds) && app.restrictedUserIds.includes(userId)) {
+      return res.status(403).json({ valid: false, error: 'Access restricted for this user.' });
     }
 
     const profile = db.user_profiles.find((p) => p.userId === userId);

@@ -1,9 +1,10 @@
 import WebSocket from 'ws';
 import { realtimeHub } from './realtime.ts';
 
-const DEFAULT_DERIV_WS_URL = 'wss://ws.derivws.com/websockets/v3';
-// Deriv official public read-only market app_id is 1089 if DERIV_APP_ID is not yet provided for public ticks
-const PUBLIC_MARKET_APP_ID = '1089';
+// Deriv's modern public WebSocket endpoint (works reliably from cloud servers & browsers)
+const PUBLIC_DERIV_WS_URL = 'wss://api.derivws.com/trading/v1/options/ws/public';
+const LEGACY_DERIV_WS_URL = 'wss://ws.derivws.com/websockets/v3';
+const DERIV_REST_BASE = 'https://api.derivws.com/trading/v1';
 
 export function getDerivAppId(): string | null {
   const configured =
@@ -12,10 +13,34 @@ export function getDerivAppId(): string | null {
 }
 
 export function getDerivWsEndpoint(): string {
-  const base = process.env.DERIV_WS_URL?.trim() || DEFAULT_DERIV_WS_URL;
-  const appId = getDerivAppId() || PUBLIC_MARKET_APP_ID;
-  const sep = base.includes('?') ? '&' : '?';
-  return `${base}${sep}app_id=${encodeURIComponent(appId)}`;
+  const raw = process.env.DERIV_WS_URL?.trim();
+  const appId = getDerivAppId() || '1089';
+
+  // If user configured modern api.derivws.com endpoint directly, use it
+  if (raw && raw.includes('api.derivws.com')) {
+    return raw.replace(/^http(s?):\/\//i, 'ws$1://');
+  }
+
+  // Build legacy ws.derivws.com endpoint safely without duplicating app_id
+  const base = (raw || LEGACY_DERIV_WS_URL).replace(/^http(s?):\/\//i, 'ws$1://');
+  try {
+    const u = new URL(base);
+    if (!u.searchParams.has('app_id')) {
+      u.searchParams.set('app_id', appId);
+    }
+    return u.toString();
+  } catch {
+    return `${LEGACY_DERIV_WS_URL}?app_id=${encodeURIComponent(appId)}`;
+  }
+}
+
+export function getPublicMarketWsEndpoints(): string[] {
+  const configured = process.env.DERIV_WS_URL?.trim();
+  const list = [PUBLIC_DERIV_WS_URL];
+  if (configured && configured.includes('api.derivws.com')) {
+    list.unshift(configured.replace(/^http(s?):\/\//i, 'ws$1://'));
+  }
+  return Array.from(new Set(list));
 }
 
 interface PendingRequest {
@@ -44,14 +69,11 @@ class DerivMarketFeedService {
   private connect(): void {
     this.status = 'CONNECTING';
     realtimeHub.broadcastDerivStatus('CONNECTING');
-    const url = getDerivWsEndpoint();
+    const endpoints = getPublicMarketWsEndpoints();
+    const url = endpoints[this.reconnectAttempts % endpoints.length];
 
     try {
-      this.ws = new WebSocket(url, {
-        headers: {
-          Origin: process.env.APP_URL || 'https://pipflowtrade.site',
-        },
-      });
+      this.ws = new WebSocket(url, { perMessageDeflate: false });
     } catch (err: any) {
       this.status = 'DISCONNECTED';
       this.lastError = err?.message || 'WebSocket initialization failed';
@@ -97,6 +119,10 @@ class DerivMarketFeedService {
       } catch {
         // Ignore non-JSON frames
       }
+    });
+
+    this.ws.on('unexpected-response', (_req, res) => {
+      this.lastError = `Upstream HTTP ${res.statusCode}`;
     });
 
     this.ws.on('error', (err) => {
@@ -161,35 +187,212 @@ class DerivMarketFeedService {
   }
 
   public async request(payload: Record<string, unknown>, timeoutMs = 12000): Promise<any> {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return executeEphemeralDerivCall(payload, undefined, timeoutMs);
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      const reqId = this.reqSeq++;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          this.pending.delete(reqId);
+          reject(new Error('Deriv API request timed out'));
+        }, timeoutMs);
+        this.pending.set(reqId, { resolve, reject, timer });
+        this.sendRaw({ ...payload, req_id: reqId });
+      });
     }
-    const reqId = this.reqSeq++;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(reqId);
-        reject(new Error('Deriv API request timed out'));
-      }, timeoutMs);
-      this.pending.set(reqId, { resolve, reject, timer });
-      this.sendRaw({ ...payload, req_id: reqId });
-    });
+
+    return executePublicDerivCall(payload, timeoutMs);
   }
 }
 
 export const derivMarketFeed = new DerivMarketFeedService();
 
+export async function executePublicDerivCall(
+  payload: Record<string, unknown>,
+  timeoutMs = 12000
+): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(PUBLIC_DERIV_WS_URL, { perMessageDeflate: false });
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        ws.close();
+      } catch {
+        // ignore
+      }
+      fn();
+    };
+    const timer = setTimeout(() => finish(() => reject(new Error('Deriv public WS timed out'))), timeoutMs);
+    ws.on('open', () => {
+      ws.send(JSON.stringify({ ...payload, req_id: 1 }));
+    });
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString()) as any;
+        if (msg.error) return finish(() => reject(new Error(msg.error.message || 'Deriv API error')));
+        return finish(() => resolve(msg));
+      } catch (err: any) {
+        return finish(() => reject(new Error(err?.message || 'Malformed Deriv response')));
+      }
+    });
+    ws.on('error', (err) => finish(() => reject(new Error(err.message || 'Deriv public WS error'))));
+  });
+}
+
 /**
- * Executes an isolated, authenticated or public Deriv WebSocket RPC call
- * using the user's decrypted Deriv OAuth token (strictly server-side).
+ * Fetches accounts from Deriv's modern REST API using an OAuth Bearer / API token
+ */
+export async function fetchDerivAccountsViaRest(accessToken: string): Promise<any[]> {
+  const resp = await fetch(`${DERIV_REST_BASE}/options/accounts`, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/json',
+    },
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Deriv accounts API error (${resp.status}): ${text}`);
+  }
+  const json = (await resp.json()) as any;
+  return Array.isArray(json?.data) ? json.data : Array.isArray(json?.accounts) ? json.accounts : Array.isArray(json) ? json : [];
+}
+
+/**
+ * Generates a short-lived pre-authenticated OTP WebSocket URL via Deriv REST API
+ */
+export async function getDerivOtpWebSocketUrl(
+  accountId: string,
+  accessToken: string,
+  accountType: 'DEMO' | 'REAL'
+): Promise<string> {
+  const resp = await fetch(`${DERIV_REST_BASE}/options/accounts/${encodeURIComponent(accountId)}/otp`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/json',
+    },
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Deriv OTP API error (${resp.status}): ${text}`);
+  }
+  const json = (await resp.json()) as any;
+  if (json?.websocket_url) return String(json.websocket_url);
+  if (json?.data?.websocket_url) return String(json.data.websocket_url);
+  const otp = json?.otp || json?.data?.otp;
+  if (!otp) throw new Error('Deriv OTP response missing otp/websocket_url');
+  const scopePath = accountType === 'DEMO' ? 'demo' : 'real';
+  return `wss://api.derivws.com/trading/v1/options/ws/${scopePath}?otp=${encodeURIComponent(otp)}`;
+}
+
+/**
+ * Executes an authenticated Deriv WebSocket RPC call.
+ * Supports both modern OAuth2/PAT tokens (via REST OTP -> pre-authenticated WS)
+ * and legacy Deriv WebSocket tokens (via authorize).
  */
 export async function executeEphemeralDerivCall(
   payload: Record<string, unknown>,
   derivToken?: string,
-  timeoutMs = 15000
+  timeoutMs = 15000,
+  accountHint?: { accountId: string; accountType: 'DEMO' | 'REAL'; authMethod?: 'OAUTH_PKCE' | 'LEGACY_WS' }
 ): Promise<any> {
-  const url = getDerivWsEndpoint();
+  if (!derivToken) {
+    return executePublicDerivCall(payload, timeoutMs);
+  }
+
+  // Try modern OTP flow if requested or if legacy WS fails with 520
+  const runViaOtpWs = async (): Promise<any> => {
+    if (!accountHint?.accountId) {
+      const accounts = await fetchDerivAccountsViaRest(derivToken);
+      if (!accounts.length) throw new Error('No Deriv accounts returned for Bearer token');
+      const first = accounts[0];
+      const accId = String(first.account_id || first.loginid || first.id);
+      const isDemo = Boolean(first.account_type === 'demo' || first.is_virtual || accId.startsWith('VRTC'));
+      if (payload.authorizeOnly) {
+        return {
+          authorize: {
+            loginid: accId,
+            currency: String(first.currency || 'USD'),
+            balance: Number(first.balance ?? 0),
+            is_virtual: isDemo,
+            account_list: accounts.map((a: any) => ({
+              loginid: String(a.account_id || a.loginid || a.id),
+              currency: String(a.currency || 'USD'),
+              is_virtual: Boolean(a.account_type === 'demo' || a.is_virtual || String(a.account_id || a.loginid).startsWith('VRTC')),
+              balance: Number(a.balance ?? 0),
+            })),
+          },
+        };
+      }
+      const otpUrl = await getDerivOtpWebSocketUrl(accId, derivToken, isDemo ? 'DEMO' : 'REAL');
+      return runPreAuthedWs(otpUrl, payload, timeoutMs);
+    }
+
+    const otpUrl = await getDerivOtpWebSocketUrl(
+      accountHint.accountId,
+      derivToken,
+      accountHint.accountType
+    );
+    return runPreAuthedWs(otpUrl, payload, timeoutMs);
+  };
+
+  if (accountHint?.authMethod === 'OAUTH_PKCE') {
+    return runViaOtpWs();
+  }
+
+  // Try legacy WebSocket first, and seamlessly fall back to modern REST/OTP if legacy WS returns 520
+  try {
+    return await runLegacyAuthedWs(getDerivWsEndpoint(), payload, derivToken, timeoutMs);
+  } catch (err: any) {
+    if (String(err?.message || '').includes('520') || String(err?.message || '').includes('Unexpected server response')) {
+      return runViaOtpWs();
+    }
+    throw err;
+  }
+}
+
+function runPreAuthedWs(wsUrl: string, payload: Record<string, unknown>, timeoutMs: number): Promise<any> {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(wsUrl, { perMessageDeflate: false });
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        ws.close();
+      } catch {
+        // ignore
+      }
+      fn();
+    };
+    const timer = setTimeout(() => finish(() => reject(new Error('Deriv OTP WebSocket timed out'))), timeoutMs);
+    ws.on('open', () => {
+      ws.send(JSON.stringify({ ...payload, req_id: 2 }));
+    });
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString()) as any;
+        if (msg.error) return finish(() => reject(new Error(msg.error.message || 'Deriv execution failed')));
+        return finish(() => resolve(msg));
+      } catch (err: any) {
+        return finish(() => reject(new Error(err?.message || 'Malformed Deriv response')));
+      }
+    });
+    ws.on('error', (err) => finish(() => reject(new Error(err.message || 'Deriv OTP WS error'))));
+  });
+}
+
+function runLegacyAuthedWs(
+  url: string,
+  payload: Record<string, unknown>,
+  derivToken: string,
+  timeoutMs: number
+): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(url, { perMessageDeflate: false });
     let settled = false;
 
     const finish = (fn: () => void) => {
@@ -209,11 +412,7 @@ export async function executeEphemeralDerivCall(
     }, timeoutMs);
 
     ws.on('open', () => {
-      if (derivToken) {
-        ws.send(JSON.stringify({ authorize: derivToken, req_id: 1 }));
-      } else {
-        ws.send(JSON.stringify({ ...payload, req_id: 2 }));
-      }
+      ws.send(JSON.stringify({ authorize: derivToken, req_id: 1 }));
     });
 
     ws.on('message', (raw) => {

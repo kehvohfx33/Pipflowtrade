@@ -17,6 +17,7 @@ import {
 import {
   derivMarketFeed,
   executeEphemeralDerivCall,
+  fetchDerivAccountsViaRest,
   getDerivAppId,
 } from '../services/deriv-ws.ts';
 import { validateTradeAgainstRisk } from '../services/risk.ts';
@@ -36,7 +37,16 @@ function inferAccountType(loginId: string, isVirtual?: number | boolean): Tradin
 
 async function persistAuthorizedDerivAccounts(params: {
   userId: string;
-  accounts: Array<{ loginId: string; token: string; currency: string; isVirtual?: boolean; landingCompany?: string; balance?: number; scopes?: string[] }>;
+  accounts: Array<{
+    loginId: string;
+    token: string;
+    currency: string;
+    isVirtual?: boolean;
+    landingCompany?: string;
+    balance?: number;
+    scopes?: string[];
+    authMethod?: 'OAUTH_PKCE' | 'LEGACY_WS';
+  }>;
 }) {
   const ts = new Date().toISOString();
   await store.transaction((db) => {
@@ -84,6 +94,7 @@ async function persistAuthorizedDerivAccounts(params: {
       const enc = encryptSecret(acc.token);
       const existingToken = db.encrypted_deriv_tokens.find((t) => t.derivAccountId === existing!.id);
       const scopes = acc.scopes?.join(',') || process.env.DERIV_OAUTH_SCOPE || 'read,trade,trading_information';
+      const authMethod = acc.authMethod || 'LEGACY_WS';
       if (!existingToken) {
         db.encrypted_deriv_tokens.push({
           id: crypto.randomUUID(),
@@ -93,6 +104,7 @@ async function persistAuthorizedDerivAccounts(params: {
           iv: enc.iv,
           authTag: enc.authTag,
           scopes,
+          authMethod,
           createdAt: ts,
           updatedAt: ts,
         });
@@ -101,6 +113,7 @@ async function persistAuthorizedDerivAccounts(params: {
         existingToken.iv = enc.iv;
         existingToken.authTag = enc.authTag;
         existingToken.scopes = scopes;
+        existingToken.authMethod = authMethod;
         existingToken.updatedAt = ts;
       }
     });
@@ -118,7 +131,18 @@ async function persistAuthorizedDerivAccounts(params: {
   });
 }
 
-// 1. Official Deriv OAuth2 Redirect Initiation
+function resolveRedirectUri(req: Request): string {
+  const configuredRedirect = process.env.DERIV_OAUTH_REDIRECT_URI?.trim();
+  if (configuredRedirect) return configuredRedirect;
+  const baseOrigin =
+    process.env.APP_URL?.trim() ||
+    process.env.FRONTEND_URL?.trim() ||
+    process.env.PUBLIC_SITE_URL?.trim() ||
+    `${req.protocol}://${req.get('host')}`;
+  return `${baseOrigin.replace(/\/$/, '')}/api/deriv/callback`;
+}
+
+// 1. Official Deriv OAuth2 Redirect Initiation (supports both OAuth2 PKCE and Classic Deriv OAuth)
 router.get('/authorize', async (req: AuthenticatedRequest, res: Response) => {
   const appId = getDerivAppId();
   if (!appId) {
@@ -132,32 +156,43 @@ router.get('/authorize', async (req: AuthenticatedRequest, res: Response) => {
   }
 
   const state = generateSecureToken(24);
+  const codeVerifier = crypto.randomBytes(32).toString('base64url');
+  const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+  const redirectUri = resolveRedirectUri(req);
   const intent = req.authUser ? 'CONNECT' : 'LOGIN';
+
   await store.transaction((db) => {
     const ts = new Date().toISOString();
     db.oauth_states.push({
       state,
       userId: req.authUser?.id || null,
       intent,
+      codeVerifier,
+      redirectUri,
       createdAt: ts,
       expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
     });
   });
 
   const oauthBase = process.env.DERIV_OAUTH_URL?.trim() || 'https://oauth.deriv.com/oauth2/authorize';
-  const configuredRedirect = process.env.DERIV_OAUTH_REDIRECT_URI?.trim();
-  const baseOrigin =
-    process.env.APP_URL?.trim() ||
-    process.env.PUBLIC_SITE_URL?.trim() ||
-    `${req.protocol}://${req.get('host')}`;
-  const redirectUri = configuredRedirect || `${baseOrigin.replace(/\/$/, '')}/api/deriv/callback`;
-
   const url = new URL(oauthBase);
-  url.searchParams.set('app_id', appId);
-  url.searchParams.set('l', 'EN');
-  url.searchParams.set('brand', 'deriv');
-  url.searchParams.set('redirect_uri', redirectUri);
-  url.searchParams.set('state', state);
+
+  if (oauthBase.includes('auth.deriv.com')) {
+    const scope = (process.env.DERIV_OAUTH_SCOPE?.trim() || 'read trade trading_information').replace(/,/g, ' ');
+    url.searchParams.set('response_type', 'code');
+    url.searchParams.set('client_id', appId);
+    url.searchParams.set('redirect_uri', redirectUri);
+    url.searchParams.set('scope', scope);
+    url.searchParams.set('state', state);
+    url.searchParams.set('code_challenge', codeChallenge);
+    url.searchParams.set('code_challenge_method', 'S256');
+  } else {
+    url.searchParams.set('app_id', appId);
+    url.searchParams.set('l', 'EN');
+    url.searchParams.set('brand', 'deriv');
+    url.searchParams.set('redirect_uri', redirectUri);
+    url.searchParams.set('state', state);
+  }
 
   return res.json({ redirectUrl: url.toString(), state });
 });
@@ -165,69 +200,162 @@ router.get('/authorize', async (req: AuthenticatedRequest, res: Response) => {
 // 2. Official Deriv OAuth2 Callback (reusable for /api/deriv/callback, /auth/callback, and root ?)
 export async function handleDerivOAuthCallback(req: AuthenticatedRequest, res: Response) {
   try {
+    if (typeof req.query.error === 'string' && req.query.error) {
+      const desc = typeof req.query.error_description === 'string' ? req.query.error_description : req.query.error;
+      return res.redirect(`/#/auth?oauth_error=${encodeURIComponent(desc)}`);
+    }
+
     const state = typeof req.query.state === 'string' ? req.query.state : '';
     const db = store.snapshot();
+    const stateRecord = state
+      ? db.oauth_states.find((s) => s.state === state && new Date(s.expiresAt).getTime() > Date.now())
+      : undefined;
 
-    if (state) {
-      const stateRecord = db.oauth_states.find(
-        (s) => s.state === state && new Date(s.expiresAt).getTime() > Date.now()
-      );
-      if (!stateRecord) {
-        return res.redirect('/#/auth?oauth_error=Invalid+or+expired+Deriv+OAuth+state');
-      }
+    if (state && !stateRecord) {
+      return res.redirect('/#/auth?oauth_error=Invalid+or+expired+Deriv+OAuth+state');
     }
 
-    // Parse Deriv standard OAuth2 query params: acct1, token1, cur1, acct2, token2, cur2 ...
-    const rawAccounts: Array<{ loginId: string; token: string; currency: string }> = [];
-    for (let i = 1; i <= 15; i += 1) {
-      const acct = req.query[`acct${i}`];
-      const tok = req.query[`token${i}`];
-      const cur = req.query[`cur${i}`];
-      if (typeof acct === 'string' && typeof tok === 'string' && acct && tok) {
-        rawAccounts.push({
-          loginId: acct,
-          token: tok,
-          currency: typeof cur === 'string' && cur ? cur : 'USD',
+    let verifiedAccounts: Array<{
+      loginId: string;
+      token: string;
+      currency: string;
+      isVirtual?: boolean;
+      landingCompany?: string;
+      balance?: number;
+      scopes?: string[];
+      authMethod: 'OAUTH_PKCE' | 'LEGACY_WS';
+    }> = [];
+    let derivEmail = '';
+    let derivFullName = '';
+
+    // Branch A: Modern Deriv OAuth2 Authorization Code + PKCE (`auth.deriv.com`)
+    if (typeof req.query.code === 'string' && req.query.code) {
+      const appId = getDerivAppId();
+      if (!appId) {
+        return res.redirect('/#/auth?oauth_error=DERIV_APP_ID+is+not+configured');
+      }
+
+      const tokenUrl = process.env.DERIV_TOKEN_URL?.trim() || 'https://auth.deriv.com/oauth2/token';
+      const redirectUri = stateRecord?.redirectUri || resolveRedirectUri(req);
+      const bodyParams = new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: req.query.code,
+        redirect_uri: redirectUri,
+        client_id: appId,
+      });
+      if (stateRecord?.codeVerifier) {
+        bodyParams.set('code_verifier', stateRecord.codeVerifier);
+      }
+      if (process.env.DERIV_CLIENT_SECRET?.trim()) {
+        bodyParams.set('client_secret', process.env.DERIV_CLIENT_SECRET.trim());
+      }
+
+      const tokenRes = await fetch(tokenUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Accept: 'application/json',
+        },
+        body: bodyParams.toString(),
+      });
+      const tokenJson = (await tokenRes.json()) as any;
+      if (!tokenRes.ok || !tokenJson?.access_token) {
+        const msg = tokenJson?.error_description || tokenJson?.error || 'Deriv OAuth code exchange failed';
+        return res.redirect(`/#/auth?oauth_error=${encodeURIComponent(msg)}`);
+      }
+
+      const accessToken = String(tokenJson.access_token);
+      const restAccounts = await fetchDerivAccountsViaRest(accessToken);
+      if (restAccounts.length === 0) {
+        return res.redirect('/#/auth?oauth_error=No+Deriv+accounts+returned+from+Deriv+API');
+      }
+
+      // Optional OIDC userinfo lookup for real email/full name
+      try {
+        const userinfoRes = await fetch('https://auth.deriv.com/oauth2/userinfo', {
+          headers: { Authorization: `Bearer ${accessToken}` },
         });
+        if (userinfoRes.ok) {
+          const ui = (await userinfoRes.json()) as any;
+          if (ui?.email) derivEmail = String(ui.email).toLowerCase();
+          if (ui?.name) derivFullName = String(ui.name);
+        }
+      } catch {
+        // userinfo is optional
       }
+
+      const scopes = typeof tokenJson.scope === 'string' ? tokenJson.scope.split(/\s+/).filter(Boolean) : undefined;
+      verifiedAccounts = restAccounts.map((a: any) => {
+        const loginId = String(a.account_id || a.loginid || a.id);
+        const isDemo = Boolean(
+          a.account_type === 'demo' || a.is_virtual || loginId.toUpperCase().startsWith('VRTC')
+        );
+        return {
+          loginId,
+          token: accessToken,
+          currency: String(a.currency || 'USD'),
+          isVirtual: isDemo,
+          landingCompany: a.landing_company ? String(a.landing_company) : undefined,
+          balance: typeof a.balance === 'number' || typeof a.balance === 'string' ? Number(a.balance) : 0,
+          scopes,
+          authMethod: 'OAUTH_PKCE' as const,
+        };
+      });
+    } else {
+      // Branch B: Classic Deriv OAuth2 (`acct1`, `token1`, `cur1` ...)
+      const rawAccounts: Array<{ loginId: string; token: string; currency: string }> = [];
+      for (let i = 1; i <= 15; i += 1) {
+        const acct = req.query[`acct${i}`];
+        const tok = req.query[`token${i}`];
+        const cur = req.query[`cur${i}`];
+        if (typeof acct === 'string' && typeof tok === 'string' && acct && tok) {
+          rawAccounts.push({
+            loginId: acct,
+            token: tok,
+            currency: typeof cur === 'string' && cur ? cur : 'USD',
+          });
+        }
+      }
+
+      if (rawAccounts.length === 0) {
+        return res.redirect('/#/auth?oauth_error=No+Deriv+accounts+returned+from+authorization');
+      }
+
+      const primaryAuth = await executeEphemeralDerivCall({ authorizeOnly: true }, rawAccounts[0].token);
+      const derivAuth = primaryAuth?.authorize;
+      if (!derivAuth?.loginid) {
+        return res.redirect('/#/auth?oauth_error=Deriv+token+verification+failed');
+      }
+
+      derivEmail = String(derivAuth.email || '').toLowerCase();
+      derivFullName = String(derivAuth.fullname || '');
+
+      verifiedAccounts = rawAccounts.map((ra, idx) => ({
+        loginId: ra.loginId,
+        token: ra.token,
+        currency: ra.currency,
+        isVirtual: ra.loginId.startsWith('VRTC') || (idx === 0 && Boolean(derivAuth.is_virtual)),
+        landingCompany: idx === 0 ? String(derivAuth.landing_company_name || '') : undefined,
+        balance: idx === 0 ? Number(derivAuth.balance ?? 0) : undefined,
+        scopes: Array.isArray(derivAuth.scopes) ? derivAuth.scopes : undefined,
+        authMethod: 'LEGACY_WS' as const,
+      }));
     }
 
-    if (rawAccounts.length === 0) {
-      return res.redirect('/#/auth?oauth_error=No+Deriv+accounts+returned+from+authorization');
+    const primaryLoginId = verifiedAccounts[0].loginId;
+    if (!derivEmail) {
+      derivEmail = `${primaryLoginId.toLowerCase()}@deriv-oauth.local`;
+    }
+    if (!derivFullName) {
+      derivFullName = primaryLoginId;
     }
 
-    // Verify primary token live against Deriv WebSocket API
-    const primaryAuth = await executeEphemeralDerivCall(
-      { authorizeOnly: true },
-      rawAccounts[0].token
-    );
-    const derivAuth = primaryAuth?.authorize;
-    if (!derivAuth?.loginid) {
-      return res.redirect('/#/auth?oauth_error=Deriv+token+verification+failed');
-    }
+    let targetUserId = req.authUser?.id || stateRecord?.userId || null;
 
-    const verifiedAccounts = rawAccounts.map((ra, idx) => ({
-      loginId: ra.loginId,
-      token: ra.token,
-      currency: ra.currency,
-      isVirtual: ra.loginId.startsWith('VRTC') || (idx === 0 && Boolean(derivAuth.is_virtual)),
-      landingCompany: idx === 0 ? String(derivAuth.landing_company_name || '') : undefined,
-      balance: idx === 0 ? Number(derivAuth.balance ?? 0) : undefined,
-      scopes: Array.isArray(derivAuth.scopes) ? derivAuth.scopes : undefined,
-    }));
-
-    let targetUserId = req.authUser?.id || null;
-    if (!targetUserId && state) {
-      const stateRecord = db.oauth_states.find((s) => s.state === state);
-      if (stateRecord?.userId) targetUserId = stateRecord.userId;
-    }
-
-    // If logging in directly via Deriv OAuth without an existing PIPFLOWTRADE session
     if (!targetUserId) {
       const linked = db.connected_deriv_accounts.find(
-        (d) => d.derivLoginId === derivAuth.loginid
+        (d) => verifiedAccounts.some((va) => va.loginId === d.derivLoginId)
       );
-      const derivEmail = String(derivAuth.email || `${derivAuth.loginid.toLowerCase()}@deriv-oauth.local`).toLowerCase();
       if (linked) {
         targetUserId = linked.userId;
       } else {
@@ -243,7 +371,7 @@ export async function handleDerivOAuthCallback(req: AuthenticatedRequest, res: R
               email: derivEmail,
               passwordHash: hashPassword(generateSecureToken(32)),
               status: 'ACTIVE',
-              emailVerified: Boolean(derivAuth.email),
+              emailVerified: !derivEmail.endsWith('@deriv-oauth.local'),
               emailVerificationTokenHash: null,
               passwordResetTokenHash: null,
               passwordResetExpiresAt: null,
@@ -255,7 +383,7 @@ export async function handleDerivOAuthCallback(req: AuthenticatedRequest, res: R
               createdAt: ts,
               updatedAt: ts,
             });
-            ensureUserRecords(uid, String(derivAuth.fullname || derivAuth.loginid), ts);
+            ensureUserRecords(uid, derivFullName, ts);
             return uid;
           });
         }
@@ -278,6 +406,12 @@ export async function handleDerivOAuthCallback(req: AuthenticatedRequest, res: R
       });
       res.cookie('pipflow_sid', rawSessionToken, getCookieOptions(SESSION_TTL_MS, true));
       res.cookie('pipflow_csrf', csrfToken, getCookieOptions(SESSION_TTL_MS, false));
+    }
+
+    if (state) {
+      await store.transaction((txDb) => {
+        txDb.oauth_states = txDb.oauth_states.filter((s) => s.state !== state);
+      });
     }
 
     await persistAuthorizedDerivAccounts({ userId: targetUserId, accounts: verifiedAccounts });
@@ -435,7 +569,16 @@ router.get('/balance', requireAuth, async (req: AuthenticatedRequest, res: Respo
       authTag: tokenRow.authTag,
     });
 
-    const resp = await executeEphemeralDerivCall({ balance: 1, account: active.derivLoginId }, derivToken);
+    const resp = await executeEphemeralDerivCall(
+      { balance: 1, account: active.derivLoginId },
+      derivToken,
+      15000,
+      {
+        accountId: active.derivLoginId,
+        accountType: active.accountType,
+        authMethod: tokenRow.authMethod,
+      }
+    );
     const liveBalance = Number(resp?.balance?.balance ?? resp?.authorize?.balance ?? active.reportedBalance);
     const currency = String(resp?.balance?.currency || active.currency);
 
@@ -585,6 +728,100 @@ router.get('/ticks/latest', (_req: Request, res: Response) => {
   });
 });
 
+// Cached Deriv active symbols list with verified fallback
+let cachedSymbols: Array<{ symbol: string; display_name: string; market: string; submarket_display_name?: string }> = [];
+let symbolsFetchedAt = 0;
+
+const VERIFIED_CORE_SYMBOLS = [
+  { symbol: 'R_100', display_name: 'Volatility 100 Index', market: 'synthetic_index', submarket_display_name: 'Continuous Indices' },
+  { symbol: 'R_50', display_name: 'Volatility 50 Index', market: 'synthetic_index', submarket_display_name: 'Continuous Indices' },
+  { symbol: 'R_25', display_name: 'Volatility 25 Index', market: 'synthetic_index', submarket_display_name: 'Continuous Indices' },
+  { symbol: 'R_10', display_name: 'Volatility 10 Index', market: 'synthetic_index', submarket_display_name: 'Continuous Indices' },
+  { symbol: '1HZ100V', display_name: 'Volatility 100 (1s) Index', market: 'synthetic_index', submarket_display_name: 'Continuous Indices' },
+  { symbol: '1HZ50V', display_name: 'Volatility 50 (1s) Index', market: 'synthetic_index', submarket_display_name: 'Continuous Indices' },
+  { symbol: 'frxEURUSD', display_name: 'EUR/USD', market: 'forex', submarket_display_name: 'Major Pairs' },
+  { symbol: 'frxGBPUSD', display_name: 'GBP/USD', market: 'forex', submarket_display_name: 'Major Pairs' },
+  { symbol: 'frxUSDJPY', display_name: 'USD/JPY', market: 'forex', submarket_display_name: 'Major Pairs' },
+  { symbol: 'cryBTCUSD', display_name: 'BTC/USD', market: 'cryptocurrency', submarket_display_name: 'Crypto' },
+];
+
+router.get('/symbols', async (_req: Request, res: Response) => {
+  if (cachedSymbols.length > 0 && Date.now() - symbolsFetchedAt < 5 * 60 * 1000) {
+    return res.json({ symbols: cachedSymbols, source: 'deriv_cache' });
+  }
+  try {
+    const resp = await derivMarketFeed.request({ active_symbols: 'brief', product_type: 'basic' }, 8000);
+    if (Array.isArray(resp?.active_symbols) && resp.active_symbols.length > 0) {
+      cachedSymbols = resp.active_symbols
+        .filter((s: any) => !s.is_trading_suspended)
+        .slice(0, 60)
+        .map((s: any) => ({
+          symbol: String(s.symbol),
+          display_name: String(s.display_name || s.symbol),
+          market: String(s.market || 'synthetic_index'),
+          submarket_display_name: s.submarket_display_name ? String(s.submarket_display_name) : undefined,
+        }));
+      symbolsFetchedAt = Date.now();
+      return res.json({ symbols: cachedSymbols, source: 'deriv_live' });
+    }
+  } catch {
+    // Fall back to verified core Deriv symbols when upstream active_symbols query is unavailable
+  }
+  return res.json({ symbols: VERIFIED_CORE_SYMBOLS, source: 'deriv_core_registry' });
+});
+
+router.get('/portfolio', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const db = store.snapshot();
+    const active =
+      db.connected_deriv_accounts.find(
+        (a) => a.userId === req.authUser!.id && a.isActive && a.connectionStatus === 'CONNECTED'
+      ) ||
+      db.connected_deriv_accounts.find(
+        (a) => a.userId === req.authUser!.id && a.connectionStatus === 'CONNECTED'
+      );
+
+    if (!active) {
+      return res.json({ connected: false, contracts: [], localOpenTrades: [] });
+    }
+
+    const tokenRow = db.encrypted_deriv_tokens.find((t) => t.derivAccountId === active.id);
+    if (!tokenRow) {
+      return res.json({ connected: false, contracts: [], localOpenTrades: [] });
+    }
+
+    const derivToken = decryptSecret({
+      ciphertext: tokenRow.ciphertext,
+      iv: tokenRow.iv,
+      authTag: tokenRow.authTag,
+    });
+
+    const portfolioResp = await executeEphemeralDerivCall(
+      { portfolio: 1 },
+      derivToken,
+      15000,
+      {
+        accountId: active.derivLoginId,
+        accountType: active.accountType,
+        authMethod: tokenRow.authMethod,
+      }
+    );
+
+    const contracts = Array.isArray(portfolioResp?.portfolio?.contracts)
+      ? portfolioResp.portfolio.contracts
+      : [];
+
+    return res.json({
+      connected: true,
+      derivLoginId: active.derivLoginId,
+      accountType: active.accountType,
+      contracts,
+    });
+  } catch (err: any) {
+    return res.status(502).json({ error: err?.message || 'Unable to fetch open Deriv portfolio.' });
+  }
+});
+
 // 9. Risk-Validated Trade Proposal & Execution via Authenticated Deriv API
 router.post('/trade/execute', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -605,6 +842,16 @@ router.post('/trade/execute', requireAuth, async (req: AuthenticatedRequest, res
     const unit = durationUnit || 't';
 
     const db = store.snapshot();
+    const appReg = db.application_registry.find((a) => a.id === targetApp);
+    if (appReg?.maintenanceMode) {
+      return res.status(503).json({
+        error: appReg.maintenanceMessage || `${appReg.name} is temporarily paused for maintenance.`,
+      });
+    }
+    if (appReg && Array.isArray(appReg.restrictedUserIds) && appReg.restrictedUserIds.includes(req.authUser!.id)) {
+      return res.status(403).json({ error: `Your account is restricted from executing via ${appReg.name}.` });
+    }
+
     const active =
       db.connected_deriv_accounts.find(
         (a) => a.userId === req.authUser!.id && a.isActive && a.connectionStatus === 'CONNECTED'
@@ -655,6 +902,12 @@ router.post('/trade/execute', requireAuth, async (req: AuthenticatedRequest, res
       authTag: tokenRow.authTag,
     });
 
+    const accountHint = {
+      accountId: active.derivLoginId,
+      accountType: active.accountType,
+      authMethod: tokenRow.authMethod,
+    };
+
     // Step A: Request authoritative proposal from Deriv
     const proposalResp = await executeEphemeralDerivCall(
       {
@@ -667,7 +920,9 @@ router.post('/trade/execute', requireAuth, async (req: AuthenticatedRequest, res
         duration_unit: unit,
         symbol: cleanSymbol,
       },
-      derivToken
+      derivToken,
+      15000,
+      accountHint
     );
 
     const proposal = proposalResp?.proposal;
@@ -681,7 +936,9 @@ router.post('/trade/execute', requireAuth, async (req: AuthenticatedRequest, res
         buy: proposal.id,
         price: numStake,
       },
-      derivToken
+      derivToken,
+      15000,
+      accountHint
     );
 
     const buy = buyResp?.buy;

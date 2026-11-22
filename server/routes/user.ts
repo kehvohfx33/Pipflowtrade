@@ -9,11 +9,11 @@ import { AppId } from '../types.ts';
 
 const router = Router();
 
-router.get('/user/profile', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+router.get(['/user/profile', '/users/profile'], requireAuth, (req: AuthenticatedRequest, res: Response) => {
   return res.json(buildUserSessionPayload(req.authUser!.id));
 });
 
-router.patch('/user/profile', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+router.patch(['/user/profile', '/users/profile'], requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const {
       fullName,
@@ -72,7 +72,7 @@ router.patch('/user/profile', requireAuth, async (req: AuthenticatedRequest, res
   }
 });
 
-router.get('/user/balances', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+router.get(['/user/balances', '/users/balances'], requireAuth, (req: AuthenticatedRequest, res: Response) => {
   const db = store.snapshot();
   const derivAccounts = db.connected_deriv_accounts
     .filter((a) => a.userId === req.authUser!.id && a.connectionStatus !== 'DISCONNECTED')
@@ -98,6 +98,7 @@ router.get('/user/balances', requireAuth, (req: AuthenticatedRequest, res: Respo
     activeDerivAccount: derivAccounts.find((a) => a.isActive) || derivAccounts[0] || null,
     platformLedger: {
       currency: ledgerAccount?.currency || 'USD',
+      status: ledgerAccount?.status || 'ACTIVE',
       availableBalance: ledgerBalance?.availableBalance || '0.00000000',
       updatedAt: ledgerBalance?.updatedAt || null,
       note: 'PIPFLOWTRADE Platform Ledger is strictly separate from your authoritative Deriv balance.',
@@ -105,7 +106,7 @@ router.get('/user/balances', requireAuth, (req: AuthenticatedRequest, res: Respo
   });
 });
 
-router.get('/user/transactions', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+router.get(['/user/transactions', '/users/transactions'], requireAuth, (req: AuthenticatedRequest, res: Response) => {
   const db = store.snapshot();
   const transactions = db.transactions
     .filter((t) => t.userId === req.authUser!.id)
@@ -125,7 +126,7 @@ router.get('/user/transactions', requireAuth, (req: AuthenticatedRequest, res: R
   return res.json({ transactions, trades, ledgerEntries });
 });
 
-router.get('/user/notifications', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+router.get(['/user/notifications', '/users/notifications'], requireAuth, (req: AuthenticatedRequest, res: Response) => {
   const notifications = store
     .snapshot()
     .notifications.filter((n) => n.userId === req.authUser!.id)
@@ -138,7 +139,7 @@ router.get('/user/notifications', requireAuth, (req: AuthenticatedRequest, res: 
   });
 });
 
-router.post('/user/notifications/read', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+router.post(['/user/notifications/read', '/users/notifications/read'], requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { notificationId } = req.body as { notificationId?: string };
   await store.transaction((db) => {
     for (const n of db.notifications) {
@@ -150,7 +151,7 @@ router.post('/user/notifications/read', requireAuth, async (req: AuthenticatedRe
   return res.json({ success: true });
 });
 
-router.get('/user/sessions', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+router.get(['/user/sessions', '/users/sessions'], requireAuth, (req: AuthenticatedRequest, res: Response) => {
   const sessions = store
     .snapshot()
     .user_sessions.filter((s) => s.userId === req.authUser!.id && !s.revokedAt)
@@ -165,7 +166,7 @@ router.get('/user/sessions', requireAuth, (req: AuthenticatedRequest, res: Respo
   return res.json({ sessions });
 });
 
-router.post('/user/sessions/:id/revoke', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+router.post(['/user/sessions/:id/revoke', '/users/sessions/:id/revoke'], requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   await store.transaction((db) => {
     const target = db.user_sessions.find(
       (s) => s.id === req.params.id && s.userId === req.authUser!.id

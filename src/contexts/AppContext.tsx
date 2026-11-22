@@ -42,6 +42,15 @@ export interface RiskSettings {
   emergencyStopActive: boolean;
 }
 
+export interface ModeStatsSummary {
+  total: number;
+  open: number;
+  closed: number;
+  wins: number;
+  losses: number;
+  profitLoss: string;
+}
+
 export interface SessionState {
   authenticated: boolean;
   user: {
@@ -61,6 +70,22 @@ export interface SessionState {
     phone: string | null;
   } | null;
   roles: string[];
+  permissions?: string[];
+  subscription?: {
+    planId: string;
+    planName: string;
+    planSlug: string;
+    allowedApps: Array<'bot' | 'trader' | 'charts' | 'options'>;
+    maxDailyTrades: number;
+    maxBots: number;
+    status: string;
+    expiresAt: string | null;
+  } | null;
+  restrictedApps?: string[];
+  tradingStats?: {
+    demo: ModeStatsSummary;
+    real: ModeStatsSummary;
+  } | null;
   accountPreferences: {
     emailNotifications: boolean;
     tradeAlerts: boolean;
@@ -79,6 +104,7 @@ export interface SessionState {
   activeDerivAccount: DerivAccountSummary | null;
   platformLedger: {
     currency: string;
+    status?: 'ACTIVE' | 'FROZEN';
     availableBalance: string;
     updatedAt: string;
   } | null;
@@ -146,6 +172,10 @@ const EMPTY_SESSION: SessionState = {
   user: null,
   profile: null,
   roles: [],
+  permissions: [],
+  subscription: null,
+  restrictedApps: [],
+  tradingStats: null,
   accountPreferences: null,
   tradingPreferences: null,
   riskSettings: null,
@@ -162,11 +192,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [session, setSession] = useState<SessionState>(EMPTY_SESSION);
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    if (params.has('acct1') && params.has('token1')) {
-      const qs = window.location.search;
-      window.history.replaceState({}, '', window.location.pathname + window.location.hash);
-      window.location.replace(`/api/deriv/callback${qs}`);
+    const hashQuery = window.location.hash.includes('?')
+      ? window.location.hash.slice(window.location.hash.indexOf('?'))
+      : '';
+    const queryToInspect = window.location.search || hashQuery;
+    if (!queryToInspect) return;
+
+    const params = new URLSearchParams(queryToInspect);
+    const isDerivCallback =
+      (params.has('acct1') && params.has('token1')) ||
+      (params.has('code') && params.has('state')) ||
+      (params.has('error') && params.has('state'));
+
+    if (isDerivCallback) {
+      window.history.replaceState({}, '', window.location.pathname + '#/auth');
+      window.location.replace(`/api/deriv/callback${queryToInspect}`);
     }
   }, []);
   const [loadingSession, setLoadingSession] = useState(true);
@@ -212,6 +252,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         user: data.user || null,
         profile: data.profile || null,
         roles: data.roles || [],
+        permissions: data.permissions || [],
+        subscription: data.subscription || null,
+        restrictedApps: data.restrictedApps || [],
+        tradingStats: data.tradingStats || null,
         accountPreferences: data.accountPreferences || null,
         tradingPreferences: data.tradingPreferences || null,
         riskSettings: data.riskSettings || null,

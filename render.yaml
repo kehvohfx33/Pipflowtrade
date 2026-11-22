@@ -29,19 +29,29 @@ services:
           property: connectionString
       - key: DERIV_APP_ID
         sync: false
-      - key: DERIV_CLIENT_SECRET
+      - key: DERIV_API_KEY
         sync: false
+      - key: DERIV_OAUTH_URL
+        value: https://oauth.deriv.com/oauth2/authorize
       - key: DERIV_OAUTH_REDIRECT_URI
         value: https://pipflowtrade.site/api/deriv/callback
+      - key: DERIV_WS_URL
+        value: wss://api.derivws.com/trading/v1/options/ws/public
       - key: JWT_SECRET
         generateValue: true
+      - key: JWT_EXPIRES_IN
+        value: 7d
       - key: SSO_SIGNING_SECRET
+        generateValue: true
+      - key: BOT_GATE_JWT_SECRET
         generateValue: true
       - key: TOKEN_ENCRYPTION_KEY
         generateValue: true
       - key: ADMIN_EMAIL
         sync: false
       - key: ADMIN_PASSWORD
+        sync: false
+      - key: ADMIN_MFA_SECRET
         sync: false
 
 databases:
