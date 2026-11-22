@@ -220,7 +220,7 @@ function resolveRedirectUri(req: Request): string {
     process.env.FRONTEND_URL?.trim() ||
     process.env.PUBLIC_SITE_URL?.trim() ||
     `${req.protocol}://${req.get('host')}`;
-  return `${baseOrigin.replace(/\/$/, '')}/api/deriv/callback`;
+  return `${baseOrigin.replace(/\/$/, '')}/api/deriv/oauth/callback`;
 }
 
 // 1. Official Deriv OAuth2 Redirect Initiation (PKCE via auth.deriv.com/oauth2/auth)
@@ -508,6 +508,7 @@ export async function handleDerivOAuthCallback(req: AuthenticatedRequest, res: R
 }
 
 router.get('/callback', handleDerivOAuthCallback);
+router.get('/oauth/callback', handleDerivOAuthCallback);
 
 // 3. Connect Official Deriv API Token (Verified Live via Deriv WebSocket `authorize`)
 router.post('/connect-token', rateLimit('deriv_token', 10, 15 * 60 * 1000), async (req: AuthenticatedRequest, res: Response) => {

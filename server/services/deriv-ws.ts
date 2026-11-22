@@ -244,19 +244,27 @@ export async function executePublicDerivCall(
  * Fetches accounts from Deriv's modern REST API using an OAuth Bearer / API token
  */
 export async function fetchDerivAccountsViaRest(accessToken: string): Promise<any[]> {
+  const appId = getDerivAppId();
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${accessToken}`,
+    Accept: 'application/json',
+  };
+  if (appId) headers['Deriv-App-ID'] = appId;
+
   const resp = await fetch(`${DERIV_REST_BASE}/options/accounts`, {
     method: 'GET',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      Accept: 'application/json',
-    },
+    headers,
   });
   if (!resp.ok) {
     const text = await resp.text();
     throw new Error(`Deriv accounts API error (${resp.status}): ${text}`);
   }
   const json = (await resp.json()) as any;
-  return Array.isArray(json?.data) ? json.data : Array.isArray(json?.accounts) ? json.accounts : Array.isArray(json) ? json : [];
+  if (Array.isArray(json?.data)) return json.data;
+  if (Array.isArray(json?.data?.accounts)) return json.data.accounts;
+  if (Array.isArray(json?.accounts)) return json.accounts;
+  if (Array.isArray(json)) return json;
+  return [];
 }
 
 /**
@@ -267,22 +275,28 @@ export async function getDerivOtpWebSocketUrl(
   accessToken: string,
   accountType: 'DEMO' | 'REAL'
 ): Promise<string> {
+  const appId = getDerivAppId();
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${accessToken}`,
+    Accept: 'application/json',
+  };
+  if (appId) headers['Deriv-App-ID'] = appId;
+
   const resp = await fetch(`${DERIV_REST_BASE}/options/accounts/${encodeURIComponent(accountId)}/otp`, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      Accept: 'application/json',
-    },
+    headers,
   });
   if (!resp.ok) {
     const text = await resp.text();
     throw new Error(`Deriv OTP API error (${resp.status}): ${text}`);
   }
   const json = (await resp.json()) as any;
+  if (json?.data?.url) return String(json.data.url);
+  if (json?.url) return String(json.url);
   if (json?.websocket_url) return String(json.websocket_url);
   if (json?.data?.websocket_url) return String(json.data.websocket_url);
   const otp = json?.otp || json?.data?.otp;
-  if (!otp) throw new Error('Deriv OTP response missing otp/websocket_url');
+  if (!otp) throw new Error('Deriv OTP response missing data.url / otp');
   const scopePath = accountType === 'DEMO' ? 'demo' : 'real';
   return `wss://api.derivws.com/trading/v1/options/ws/${scopePath}?otp=${encodeURIComponent(otp)}`;
 }
