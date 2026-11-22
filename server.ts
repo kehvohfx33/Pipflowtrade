@@ -119,8 +119,8 @@ async function startServer() {
   app.get('/', (req, res, next) => {
     if (
       (typeof req.query.acct1 === 'string' && typeof req.query.token1 === 'string') ||
-      (typeof req.query.code === 'string' && typeof req.query.state === 'string') ||
-      (typeof req.query.error === 'string' && typeof req.query.state === 'string')
+      (typeof req.query.code === 'string' && req.query.code.length > 0) ||
+      (typeof req.query.error === 'string' && req.query.error.length > 0)
     ) {
       return handleDerivOAuthCallback(req as any, res);
     }

@@ -131,6 +131,87 @@ async function persistAuthorizedDerivAccounts(params: {
   });
 }
 
+function resolveOAuthClientId(): string | null {
+  return process.env.DERIV_OAUTH_CLIENT_ID?.trim() || getDerivAppId();
+}
+
+function resolveDerivOAuthEndpoints(): {
+  authUrl: string;
+  tokenUrl: string;
+  userinfoUrl: string;
+  isModernOidc: boolean;
+} {
+  const isStaging =
+    process.env.DERIV_ENV?.trim().toLowerCase() === 'staging' ||
+    (process.env.DERIV_OAUTH_URL || '').includes('staging');
+
+  const defaultAuth = isStaging
+    ? 'https://staging-auth.deriv.com/oauth2/auth'
+    : 'https://auth.deriv.com/oauth2/auth';
+  const defaultToken = isStaging
+    ? 'https://staging-auth.deriv.com/oauth2/token'
+    : 'https://auth.deriv.com/oauth2/token';
+  const defaultUserInfo = isStaging
+    ? 'https://staging-auth.deriv.com/userinfo'
+    : 'https://auth.deriv.com/userinfo';
+
+  let rawAuth = process.env.DERIV_OAUTH_URL?.trim() || defaultAuth;
+  try {
+    const parsed = new URL(rawAuth);
+    // Deriv retired oauth.deriv.com/oauth2/authorize (it now 302-redirects to deriv.com marketing homepage)
+    // and auth.deriv.com/oauth2/authorize returns 404; official endpoint is /oauth2/auth.
+    if (
+      parsed.hostname === 'oauth.deriv.com' ||
+      parsed.hostname === 'deriv.com' ||
+      parsed.hostname === 'www.deriv.com'
+    ) {
+      rawAuth = defaultAuth;
+    } else if (
+      (parsed.hostname === 'auth.deriv.com' || parsed.hostname === 'staging-auth.deriv.com') &&
+      (parsed.pathname === '/' || parsed.pathname === '/oauth2/authorize')
+    ) {
+      parsed.pathname = '/oauth2/auth';
+      rawAuth = parsed.toString();
+    }
+  } catch {
+    rawAuth = defaultAuth;
+  }
+
+  const finalParsed = new URL(rawAuth);
+  const isModernOidc =
+    finalParsed.hostname === 'auth.deriv.com' || finalParsed.hostname === 'staging-auth.deriv.com';
+
+  return {
+    authUrl: rawAuth,
+    tokenUrl: process.env.DERIV_TOKEN_URL?.trim() || defaultToken,
+    userinfoUrl: process.env.DERIV_USERINFO_URL?.trim() || defaultUserInfo,
+    isModernOidc,
+  };
+}
+
+function resolveDerivOAuthScope(): string {
+  const raw = process.env.DERIV_OAUTH_SCOPE?.trim();
+  if (!raw) return 'trade';
+
+  const modernValid = new Set([
+    'trade',
+    'account_manage',
+    'payment',
+    'application_read',
+    'openid',
+    'offline',
+    'offline_access',
+  ]);
+  const mapped = raw
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => (s === 'payments' ? 'payment' : s))
+    .filter((s) => modernValid.has(s));
+
+  return mapped.length > 0 ? Array.from(new Set(mapped)).join(' ') : 'trade';
+}
+
 function resolveRedirectUri(req: Request): string {
   const configuredRedirect = process.env.DERIV_OAUTH_REDIRECT_URI?.trim();
   if (configuredRedirect) return configuredRedirect;
@@ -142,16 +223,16 @@ function resolveRedirectUri(req: Request): string {
   return `${baseOrigin.replace(/\/$/, '')}/api/deriv/callback`;
 }
 
-// 1. Official Deriv OAuth2 Redirect Initiation (supports both OAuth2 PKCE and Classic Deriv OAuth)
+// 1. Official Deriv OAuth2 Redirect Initiation (PKCE via auth.deriv.com/oauth2/auth)
 router.get('/authorize', async (req: AuthenticatedRequest, res: Response) => {
-  const appId = getDerivAppId();
-  if (!appId) {
+  const clientId = resolveOAuthClientId();
+  if (!clientId) {
     return res.status(503).json({
-      error: 'Deriv OAuth2 is not configured on this server (missing DERIV_APP_ID).',
+      error: 'Deriv OAuth2 is not configured on this server (missing DERIV_APP_ID / DERIV_OAUTH_CLIENT_ID).',
       configurationRequired: ['DERIV_APP_ID', 'DERIV_OAUTH_REDIRECT_URI'],
       alternativeSupported: true,
       message:
-        'Configure DERIV_APP_ID in environment variables for OAuth2 redirect, or connect an official Deriv API token via Settings / Auth.',
+        'Configure DERIV_APP_ID (your Deriv OAuth2 Client ID) in environment variables, or connect an official Deriv API token via Settings / Auth.',
     });
   }
 
@@ -162,7 +243,9 @@ router.get('/authorize', async (req: AuthenticatedRequest, res: Response) => {
   const intent = req.authUser ? 'CONNECT' : 'LOGIN';
 
   await store.transaction((db) => {
-    const ts = new Date().toISOString();
+    const nowMs = Date.now();
+    const ts = new Date(nowMs).toISOString();
+    db.oauth_states = db.oauth_states.filter((s) => new Date(s.expiresAt).getTime() > nowMs);
     db.oauth_states.push({
       state,
       userId: req.authUser?.id || null,
@@ -170,24 +253,23 @@ router.get('/authorize', async (req: AuthenticatedRequest, res: Response) => {
       codeVerifier,
       redirectUri,
       createdAt: ts,
-      expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+      expiresAt: new Date(nowMs + 10 * 60 * 1000).toISOString(),
     });
   });
 
-  const oauthBase = process.env.DERIV_OAUTH_URL?.trim() || 'https://oauth.deriv.com/oauth2/authorize';
-  const url = new URL(oauthBase);
+  const { authUrl, isModernOidc } = resolveDerivOAuthEndpoints();
+  const url = new URL(authUrl);
 
-  if (oauthBase.includes('auth.deriv.com')) {
-    const scope = (process.env.DERIV_OAUTH_SCOPE?.trim() || 'read trade trading_information').replace(/,/g, ' ');
+  if (isModernOidc) {
     url.searchParams.set('response_type', 'code');
-    url.searchParams.set('client_id', appId);
+    url.searchParams.set('client_id', clientId);
     url.searchParams.set('redirect_uri', redirectUri);
-    url.searchParams.set('scope', scope);
+    url.searchParams.set('scope', resolveDerivOAuthScope());
     url.searchParams.set('state', state);
     url.searchParams.set('code_challenge', codeChallenge);
     url.searchParams.set('code_challenge_method', 'S256');
   } else {
-    url.searchParams.set('app_id', appId);
+    url.searchParams.set('app_id', clientId);
     url.searchParams.set('l', 'EN');
     url.searchParams.set('brand', 'deriv');
     url.searchParams.set('redirect_uri', redirectUri);
@@ -197,7 +279,7 @@ router.get('/authorize', async (req: AuthenticatedRequest, res: Response) => {
   return res.json({ redirectUrl: url.toString(), state });
 });
 
-// 2. Official Deriv OAuth2 Callback (reusable for /api/deriv/callback, /auth/callback, and root ?)
+// 2. Official Deriv OAuth2 Callback (reusable for /api/deriv/callback, /auth/callback, /oauth/callback, and /)
 export async function handleDerivOAuthCallback(req: AuthenticatedRequest, res: Response) {
   try {
     if (typeof req.query.error === 'string' && req.query.error) {
@@ -212,7 +294,7 @@ export async function handleDerivOAuthCallback(req: AuthenticatedRequest, res: R
       : undefined;
 
     if (state && !stateRecord) {
-      return res.redirect('/#/auth?oauth_error=Invalid+or+expired+Deriv+OAuth+state');
+      return res.redirect('/#/auth?oauth_error=Invalid+or+expired+Deriv+OAuth+state.+Please+try+again.');
     }
 
     let verifiedAccounts: Array<{
@@ -230,18 +312,18 @@ export async function handleDerivOAuthCallback(req: AuthenticatedRequest, res: R
 
     // Branch A: Modern Deriv OAuth2 Authorization Code + PKCE (`auth.deriv.com`)
     if (typeof req.query.code === 'string' && req.query.code) {
-      const appId = getDerivAppId();
-      if (!appId) {
+      const clientId = resolveOAuthClientId();
+      if (!clientId) {
         return res.redirect('/#/auth?oauth_error=DERIV_APP_ID+is+not+configured');
       }
 
-      const tokenUrl = process.env.DERIV_TOKEN_URL?.trim() || 'https://auth.deriv.com/oauth2/token';
+      const { tokenUrl, userinfoUrl } = resolveDerivOAuthEndpoints();
       const redirectUri = stateRecord?.redirectUri || resolveRedirectUri(req);
       const bodyParams = new URLSearchParams({
         grant_type: 'authorization_code',
         code: req.query.code,
         redirect_uri: redirectUri,
-        client_id: appId,
+        client_id: clientId,
       });
       if (stateRecord?.codeVerifier) {
         bodyParams.set('code_verifier', stateRecord.codeVerifier);
@@ -258,9 +340,9 @@ export async function handleDerivOAuthCallback(req: AuthenticatedRequest, res: R
         },
         body: bodyParams.toString(),
       });
-      const tokenJson = (await tokenRes.json()) as any;
+      const tokenJson = (await tokenRes.json().catch(() => ({}))) as any;
       if (!tokenRes.ok || !tokenJson?.access_token) {
-        const msg = tokenJson?.error_description || tokenJson?.error || 'Deriv OAuth code exchange failed';
+        const msg = tokenJson?.error_description || tokenJson?.error || `Deriv OAuth code exchange failed (${tokenRes.status})`;
         return res.redirect(`/#/auth?oauth_error=${encodeURIComponent(msg)}`);
       }
 
@@ -270,9 +352,9 @@ export async function handleDerivOAuthCallback(req: AuthenticatedRequest, res: R
         return res.redirect('/#/auth?oauth_error=No+Deriv+accounts+returned+from+Deriv+API');
       }
 
-      // Optional OIDC userinfo lookup for real email/full name
+      // Optional OIDC userinfo lookup for real email/full name (official endpoint is /userinfo)
       try {
-        const userinfoRes = await fetch('https://auth.deriv.com/oauth2/userinfo', {
+        const userinfoRes = await fetch(userinfoUrl, {
           headers: { Authorization: `Bearer ${accessToken}` },
         });
         if (userinfoRes.ok) {
