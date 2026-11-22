@@ -1,0 +1,6 @@
+{
+  "name": "PIPFLOWTRADE.SITE",
+  "description": "Enterprise multi-application Deriv trading workspace unifying Bot, Trader, Charts, and Options with central SSO, real-time Deriv WebSocket feeds, risk management, platform ledger, and private administration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
