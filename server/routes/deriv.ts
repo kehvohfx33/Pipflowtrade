@@ -21,11 +21,11 @@ import {
 } from '../services/deriv-ws.ts';
 import { validateTradeAgainstRisk } from '../services/risk.ts';
 import { realtimeHub } from '../services/realtime.ts';
-import { buildUserSessionPayload, ensureUserRecords } from './auth.ts';
+import { buildUserSessionPayload, ensureUserRecords, getSessionTtlMs } from './auth.ts';
 import { AppId, TradingMode } from '../types.ts';
 
 const router = Router();
-const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const SESSION_TTL_MS = getSessionTtlMs();
 
 function inferAccountType(loginId: string, isVirtual?: number | boolean): TradingMode {
   if (isVirtual === 1 || isVirtual === true || loginId.toUpperCase().startsWith('VRTC')) {
@@ -145,9 +145,12 @@ router.get('/authorize', async (req: AuthenticatedRequest, res: Response) => {
   });
 
   const oauthBase = process.env.DERIV_OAUTH_URL?.trim() || 'https://oauth.deriv.com/oauth2/authorize';
-  const redirectUri =
-    process.env.DERIV_OAUTH_REDIRECT_URI?.trim() ||
-    `${req.protocol}://${req.get('host')}/api/deriv/callback`;
+  const configuredRedirect = process.env.DERIV_OAUTH_REDIRECT_URI?.trim();
+  const baseOrigin =
+    process.env.APP_URL?.trim() ||
+    process.env.PUBLIC_SITE_URL?.trim() ||
+    `${req.protocol}://${req.get('host')}`;
+  const redirectUri = configuredRedirect || `${baseOrigin.replace(/\/$/, '')}/api/deriv/callback`;
 
   const url = new URL(oauthBase);
   url.searchParams.set('app_id', appId);
@@ -159,8 +162,8 @@ router.get('/authorize', async (req: AuthenticatedRequest, res: Response) => {
   return res.json({ redirectUrl: url.toString(), state });
 });
 
-// 2. Official Deriv OAuth2 Callback
-router.get('/callback', async (req: AuthenticatedRequest, res: Response) => {
+// 2. Official Deriv OAuth2 Callback (reusable for /api/deriv/callback, /auth/callback, and root ?)
+export async function handleDerivOAuthCallback(req: AuthenticatedRequest, res: Response) {
   try {
     const state = typeof req.query.state === 'string' ? req.query.state : '';
     const db = store.snapshot();
@@ -286,7 +289,9 @@ router.get('/callback', async (req: AuthenticatedRequest, res: Response) => {
     console.error('[deriv/callback] Error:', err);
     return res.redirect(`/#/auth?oauth_error=${encodeURIComponent(err?.message || 'Deriv OAuth callback error')}`);
   }
-});
+}
+
+router.get('/callback', handleDerivOAuthCallback);
 
 // 3. Connect Official Deriv API Token (Verified Live via Deriv WebSocket `authorize`)
 router.post('/connect-token', rateLimit('deriv_token', 10, 15 * 60 * 1000), async (req: AuthenticatedRequest, res: Response) => {

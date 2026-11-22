@@ -17,7 +17,19 @@ import { sendTransactionalEmail } from '../services/email.ts';
 import { realtimeHub } from '../services/realtime.ts';
 
 const router = Router();
-const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function getSessionTtlMs(): number {
+  const raw = process.env.JWT_EXPIRES_IN?.trim() || '7d';
+  const match = raw.match(/^(\d+)([smhd])?$/i);
+  if (!match) return 7 * 24 * 60 * 60 * 1000;
+  const val = Number(match[1]);
+  const unit = (match[2] || 's').toLowerCase();
+  const mult =
+    unit === 'd' ? 86400000 : unit === 'h' ? 3600000 : unit === 'm' ? 60000 : 1000;
+  return Math.max(60000, val * mult);
+}
+
+const SESSION_TTL_MS = getSessionTtlMs();
 
 function ensureUserRecords(userId: string, fullName: string, ts: string) {
   const db = store.snapshot();

@@ -8,7 +8,7 @@ import helmet from 'helmet';
 import { createServer as createViteServer } from 'vite';
 import { attachOptionalUser, requireCsrf } from './server/middleware/security.ts';
 import authRoutes from './server/routes/auth.ts';
-import derivRoutes from './server/routes/deriv.ts';
+import derivRoutes, { handleDerivOAuthCallback } from './server/routes/deriv.ts';
 import appsRoutes from './server/routes/apps.ts';
 import userRoutes from './server/routes/user.ts';
 import adminRoutes from './server/routes/admin.ts';
@@ -66,6 +66,8 @@ async function startServer() {
       'https://options.pipflowtrade.site',
       process.env.APP_URL,
       process.env.FRONTEND_URL,
+      process.env.PUBLIC_SITE_URL,
+      process.env.VITE_API_URL,
       'http://localhost:3000',
     ].filter(Boolean) as string[]
   );
@@ -105,6 +107,24 @@ async function startServer() {
   app.use('/api', appsRoutes);
   app.use('/api', userRoutes);
   app.use('/api/private-admin', adminRoutes);
+
+  // Support Deriv OAuth2 callback even if developers.deriv.com points to /auth/callback, /oauth/callback, or /
+  app.get('/auth/callback', handleDerivOAuthCallback);
+  app.get('/oauth/callback', handleDerivOAuthCallback);
+  app.get('/', (req, res, next) => {
+    if (typeof req.query.acct1 === 'string' && typeof req.query.token1 === 'string') {
+      return handleDerivOAuthCallback(req as any, res);
+    }
+    next();
+  });
+
+  // Support optional ADMIN_PRIVATE_SLUG route from Render env (still requires server admin auth)
+  const adminSlug = process.env.ADMIN_PRIVATE_SLUG?.trim().replace(/^\/+/, '');
+  if (adminSlug) {
+    app.get(`/${adminSlug}`, (_req, res) => {
+      res.redirect('/#/admin');
+    });
+  }
 
   // Attach Real-Time WebSocket Hub & Start Live Deriv Market Relay
   realtimeHub.attach(server, (symbol) => {

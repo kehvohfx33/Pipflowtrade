@@ -6,7 +6,8 @@ const DEFAULT_DERIV_WS_URL = 'wss://ws.derivws.com/websockets/v3';
 const PUBLIC_MARKET_APP_ID = '1089';
 
 export function getDerivAppId(): string | null {
-  const configured = process.env.DERIV_APP_ID?.trim();
+  const configured =
+    process.env.DERIV_APP_ID?.trim() || process.env.VITE_DERIV_APP_ID?.trim();
   return configured && configured.length > 0 ? configured : null;
 }
 

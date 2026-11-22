@@ -20,7 +20,11 @@ export function getJwtSecret(): string {
 }
 
 export function getSsoSigningSecret(): string {
-  return process.env.SSO_SIGNING_SECRET?.trim() || getJwtSecret();
+  return (
+    process.env.SSO_SIGNING_SECRET?.trim() ||
+    process.env.BOT_GATE_JWT_SECRET?.trim() ||
+    getJwtSecret()
+  );
 }
 
 export function hashPassword(password: string): string {

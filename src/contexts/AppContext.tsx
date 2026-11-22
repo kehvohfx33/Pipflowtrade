@@ -160,6 +160,15 @@ const AppContext = createContext<AppContextValue | null>(null);
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [route, setRoute] = useState<AppRoute>(() => parseRouteFromLocation());
   const [session, setSession] = useState<SessionState>(EMPTY_SESSION);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.has('acct1') && params.has('token1')) {
+      const qs = window.location.search;
+      window.history.replaceState({}, '', window.location.pathname + window.location.hash);
+      window.location.replace(`/api/deriv/callback${qs}`);
+    }
+  }, []);
   const [loadingSession, setLoadingSession] = useState(true);
   const [ticks, setTicks] = useState<Record<string, TickData>>({});
   const [derivFeedStatus, setDerivFeedStatus] = useState<'CONNECTED' | 'CONNECTING' | 'DISCONNECTED'>('CONNECTING');
